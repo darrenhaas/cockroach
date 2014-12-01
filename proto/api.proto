@@ -393,3 +393,10 @@ message AdminSplitRequest {
 message AdminSplitResponse {
   optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
 }
+
+// An MergeResponse is the return value from the MergeEmpty()
+// method.
+message MergeResponse {
+  optional ResponseHeader header = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  optional bytes merged_range_key = 2 [(gogoproto.nullable) = false, (gogoproto.customtype) = "Key"];
+}
