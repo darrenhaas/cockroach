@@ -442,3 +442,66 @@ func TestStoreRangeSplitOnConfigs(t *testing.T) {
 		t.Errorf("expected splits not found: %s", err)
 	}
 }
+
+// TestMergeEmpty
+func TestMergeEmpty(t *testing.T) {
+	store := createTestStore(t)
+	defer store.Stop()
+	splitKey := proto.Key("m")
+
+	// First, write some values to the left of the proposed split key.
+	rngOriginal := store.LookupRange(engine.KeyMin, nil)
+	pArgs, pReply := putArgs(proto.Key("c"), []byte("xxxxxx"), rngOriginal.RangeID)
+	if err := store.ExecuteCmd(proto.Put, pArgs, pReply); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get the original stats
+	msOriginal, err := engine.MVCCGetRangeStats(store.Engine(), rngOriginal.RangeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Split the range.
+	args, reply := adminSplitArgs(engine.KeyMin, splitKey, 1)
+	if err := store.ExecuteCmd(proto.AdminSplit, args, reply); err != nil {
+		t.Fatal(err)
+	}
+
+	rngLeft := store.LookupRange(engine.KeyMin, engine.KeyMin)
+	rngRight := store.LookupRange(splitKey, splitKey)
+
+	// Get the stats for both the old and new range and confirm they're correct
+	msLeft, err := engine.MVCCGetRangeStats(store.Engine(), rngLeft.RangeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msRight, err := engine.MVCCGetRangeStats(store.Engine(), rngRight.RangeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expMsRight := engine.MVCCStats{
+		LiveBytes:   0,
+		KeyBytes:    0,
+		ValBytes:    0,
+		IntentBytes: 0,
+		LiveCount:   0,
+		KeyCount:    0,
+		ValCount:    0,
+		IntentCount: 0,
+	}
+	if !reflect.DeepEqual(expMsRight, *msRight) {
+		t.Errorf("expected right range to be empty: %+v != %v", expMsRight, msRight)
+	}
+
+	if !reflect.DeepEqual(*msOriginal, *msLeft) {
+		t.Errorf("expected left range to be the same as the original range: %+v != %v", msOriginal, msLeft)
+	}
+
+	// Merge the right range back to the original one
+	if err := rngRight.MergeEmpty(); err != nil {
+		t.Errorf("Failed to merge: %v", err)
+	}
+
+}

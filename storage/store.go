@@ -560,6 +560,21 @@ func (s *Store) SplitRange(origRng, newRng *Range) error {
 	return nil
 }
 
+// MergeRange ...
+func (s *Store) MergeRange(rng *Range, endKey proto.Key) error {
+	if !bytes.Equal(origRng.Desc.EndKey, newRng.Desc.EndKey) ||
+		bytes.Compare(origRng.Desc.StartKey, newRng.Desc.StartKey) >= 0 {
+		return util.Errorf("orig range is not splittable by new range: %+v, %+v", origRng.Desc, newRng.Desc)
+	}
+
+	// Set the end key of the range. Seem comments in SplitRange
+	// for details on mutex locking.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	origRng.Desc.EndKey = endKey
+	return nil
+}
+
 // AddRange adds the range to the store's range map and to the sorted
 // rangesByKey slice.
 func (s *Store) AddRange(rng *Range) {

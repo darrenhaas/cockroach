@@ -139,6 +139,7 @@ type RangeManager interface {
 	// Range manipulation methods.
 	NewRangeDescriptor(start, end proto.Key, replicas []proto.Replica) (*proto.RangeDescriptor, error)
 	SplitRange(origRng, newRng *Range) error
+	MergeRange(callingRng *Range) error
 	AddRange(rng *Range)
 	RemoveRange(rng *Range) error
 	CreateSnapshot() (string, error)
@@ -1381,71 +1382,88 @@ func (r *Range) AdminSplit(args *proto.AdminSplitRequest, reply *proto.AdminSpli
 	}
 }
 
-// MergeEmpty attempts to merge an empty range into the range that precedes
-// it in the key space.
-func (r *Range) MergeEmpty() error {
-	// Only allow a single merge/split per range at a time.
+// mergeTrigger is called on a successful commit of an AdminMerge
+// transaction. It recomputes stats for the receiving range.
+func (r *Range) mergeTrigger(batch engine.Engine, merge *proto.MergeTrigger) error {
+	if !bytes.Equal(r.Desc.StartKey, merge.ReceiverDesc.StartKey) {
+		return util.Errorf("range start keys do not match: %q != %q", merge.ReceiverDesc.StartKey,
+			r.Desc.StartKey)
+	}
+
+	if !r.Desc.EndKey.Less(merge.ReceiverDesc.EndKey) {
+		return util.Errorf("range end key is not less than then merge end key: %q < %q", r.Desc.EndKey, merge.ReceiverDesc.StartKey)
+	}
+
+	// Compute stats for updated range.
+	ms, err := engine.MVCCComputeStats(r.rm.Engine(), merge.ReceiverDesc.StartKey, merge.ReceiverDesc.EndKey)
+	if err != nil {
+		return util.Errorf("unable to compute stats for the range after merge: %s", err)
+	}
+	ms.SetStats(batch, r.RangeID, 0)
+
+	// Write-lock the mutex to protect Desc, as MergeRange will modify
+	// Desc.EndKey.
+	r.Lock()
+	defer r.Unlock()
+	return r.rm.MergeRange(r, merge.ReceiverDesc.EndKey)
+}
+
+// AdminMerge ...
+func (r *Range) AdminMerge(args *proto.AdminMergeRequest, reply *proto.AdminMergeResponse) {
+	// Only allow a single split/merge per range at a time.
 	if !atomic.CompareAndSwapInt32(&r.splitting, int32(0), int32(1)) {
-		return util.Errorf("already splitting/merging range %d", r.RangeID)
+		reply.SetGoError(util.Errorf("already splitting/merging range %d", r.RangeID))
+		return
 	}
 	defer func() { atomic.StoreInt32(&r.splitting, int32(0)) }()
-	//TODO(bram): perhaps also check previous range for splitting lock?
 
-	// Ranges are always merged to the previous one, so the first range cannot be merged
-	if r.IsFirstRange() {
-		return util.Errorf("Cannot merged first range", r.RangeID)
+	// Ensure the calling range exists
+	if args.CallingRange == nil {
+		reply.SetGoError(util.Error("No calling range specified"))
+		return
+	}
+
+	// Make sure the range being merged follows this one
+	callingDesc := args.CallingRange
+	if !bytes.Equal(r.Desc.EndKey, callingDesc.StartKey) {
+		reply.SetGoError(util.Errorf("Ranges that are not adjacent cannot be merged %d-%d",
+			r.Desc.EndKey, callingDesc.StartKey))
+		return
 	}
 
 	// Check to make sure the range is indeed empty.
-	keyCount, err := engine.GetRangeStat(r.rm.Engine(), r.RangeID, engine.StatKeyCount)
+	keyCount, err := engine.GetRangeStat(r.rm.Engine(), callingDesc.RangeID, engine.StatKeyCount)
 	if err != nil {
-		return err
+		reply.SetGoError(util.Errorf("unable to get range stats: %s", err))
+		return
 	}
 	if keyCount > 0 {
-		return util.Errorf("Range %d is not empty", r.RangeID)
+		reply.SetGoError(util.Errorf("Range %d is not empty", callingDesc.RangeID))
+		return
 	}
 
-	// Always merge to the range that comes before the start key, which ensures
-	// the immutability of the start key for any given range
-	prevKey := r.Desc.StartKey.Prev()
-	prevRangeAddress := engine.KeyAddress(prevKey)
-	irlRequest := &proto.InternalRangeLookupRequest{
-		RequestHeader: proto.RequestHeader{
-			Key:  prevRangeAddress,
-			User: UserRoot,
-		},
-		MaxRanges: 1,
-	}
-	irlResponse := &proto.InternalRangeLookupResponse{}
-	if err := r.rm.DB().Call(proto.InternalRangeLookup, irlRequest, irlResponse); err != nil {
-		return err
-	}
-	if irlResponse.Ranges == nil || len(irlResponse.Ranges) != 1 {
-		return util.Error("Could not find previous range")
-	}
-	receivingDesc := irlResponse.Ranges[0]
+	// Init updated version of existing range descriptor.
+	updatedDesc := *r.Desc
+	updatedDesc.EndKey = callingDesc.EndKey
 
-	log.Infof("initiating a merge of range %d %q-%q into range %d %q", r.RangeID,
+	log.Infof("initiating a merge of range %d %q-%q into range %d %q-%q", callingDesc.RangeID,
 		proto.Key(r.Desc.StartKey), proto.Key(r.Desc.EndKey),
-		receivingDesc.RaftID, receivingDesc.StartKey)
-
-	// Init updated version of receiving range descriptor.
-	receivingDesc.EndKey = proto.Key(r.Desc.EndKey)
+		r.RangeID, r.Desc.StartKey, r.Desc.EndKey)
 
 	txnOpts := &client.TransactionOptions{
-		Name: fmt.Sprintf("merge range %d into %d", r.RangeID, receivingDesc.RaftID),
+		Name: fmt.Sprintf("merge range %d into %d", callingDesc.RangeID, r.RangeID),
 	}
 	if err = r.rm.DB().RunTransaction(txnOpts, func(txn *client.KV) error {
-		receivingRangeKey := makeRangeKey(receivingDesc.StartKey)
+		receivingRangeKey := makeRangeKey(r.desc.StartKey)
 		// Update the range descriptor for the receiving range
-		if err := txn.PreparePutProto(receivingRangeKey, &receivingDesc); err != nil {
+		if err := txn.PreparePutProto(receivingRangeKey, &r.Desc); err != nil {
 			return err
 		}
 
 		// Remove the range descriptor for the deleted range
 		deleteRequest := &proto.DeleteRequest{
 			RequestHeader: proto.RequestHeader{
-				Key:  makeRangeKey(r.Desc.StartKey),
+				Key:  makeRangeKey(callingDesc.StartKey),
 				User: UserRoot,
 			},
 		}
@@ -1455,14 +1473,20 @@ func (r *Range) MergeEmpty() error {
 			return util.Error(deleteResponse.Error)
 		}
 
-		if err := UpdateRangeAddressing(txn, &receivingDesc); err != nil {
+		if err := UpdateRangeAddressing(txn, &r.Desc); err != nil {
 			return err
 		}
 
-		return nil
+		// End the transaction manually, instead of letting RunTransaction
+		// loop do it, in order to provide a merge trigger.
+		return txn.Call(proto.EndTransaction, &proto.EndTransactionRequest{
+			RequestHeader: proto.RequestHeader{Key: args.Key},
+			Commit:        true,
+			MergeTrigger: &proto.MergeTrigger{
+				UpdatedDesc: updatedDesc,
+			},
+		}, &proto.EndTransactionResponse{})
 	}); err != nil {
-		return util.Errorf("merge of range %d into %d failed: %s", r.RangeID, receivingDesc.RaftID, err)
+		reply.SetGoError(util.Errorf("merge of range %d into %d failed: %s", callingRange.RangeID, r.RangeID, err))
 	}
-
-	return nil
 }
