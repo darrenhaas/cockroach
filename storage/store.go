@@ -553,6 +553,48 @@ func (s *Store) SplitRange(origRng, newRng *Range) error {
 	return s.addRangeInternal(newRng, true)
 }
 
+// MergeRange expands the subsuming range to absorb the subsumed range.
+// This merge operation will fail if the two ranges are not colocated
+// on the same store.
+func (s *Store) MergeRange(subsumingRng *Range, updatedEndKey proto.Key, subsumedRaftID int64) error {
+	if !subsumingRng.Desc.EndKey.Less(updatedEndKey) {
+		return util.Errorf("the new end key is not greater than the current one: %+v < %+v",
+			updatedEndKey, subsumingRng.Desc.EndKey)
+	}
+
+	subsumedRng, err := s.GetRange(subsumedRaftID)
+	if err != nil {
+		return util.Errorf("The two ranges %d and %d are not colocated.",
+			subsumingRng.Desc.RaftID, subsumedRaftID)
+	}
+
+	// See comments in SplitRange for details on mutex locking.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Firstly, update the end key of the subsuming range.
+	subsumingRng.Desc.EndKey = updatedEndKey
+
+	// Secondly, set the subsumed range's end key to its start key
+	// to stop it from receiving any new puts.
+	subsumedRng.Desc.StartKey = subsumedRng.Desc.EndKey
+
+	// Thirdly, copy the subsumed range's response cache into the subsuming one.
+	if err = subsumedRng.respCache.CopyInto(subsumingRng.rm.Engine(), subsumingRng.Desc.RaftID); err != nil {
+		return util.Errorf("unable to copy response cache from subsumed range: %s", err)
+	}
+
+	// Finally, remove and destroy the subsumed range.
+	if err = s.RemoveRange(subsumedRng); err != nil {
+		return util.Errorf("cannot remove range %s", err)
+	}
+	if err = subsumedRng.Destroy(); err != nil {
+		return util.Errorf("cannot destory range %s", err)
+	}
+
+	return nil
+}
+
 // AddRange adds the range to the store's range map and to the sorted
 // rangesByKey slice.
 func (s *Store) AddRange(rng *Range) error {
